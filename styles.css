@@ -1,0 +1,114 @@
+/* External Bridge Plugin Styles */
+
+.external-bridge-modal {
+  padding: 8px;
+}
+
+.external-bridge-modal .bridge-subtitle {
+  color: var(--text-muted);
+  margin-bottom: 20px;
+  font-size: 0.9em;
+}
+
+.external-bridge-modal .bridge-empty {
+  color: var(--text-muted);
+  font-style: italic;
+  text-align: center;
+  padding: 24px 0;
+}
+
+/* Bridge list */
+.bridge-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.bridge-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  background: var(--background-secondary);
+}
+
+.bridge-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.bridge-badges {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.bridge-badge {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.7em;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.bridge-path {
+  font-family: var(--font-monospace);
+  font-size: 0.78em;
+  color: var(--text-muted);
+  word-break: break-all;
+  margin: 2px 0;
+}
+
+.bridge-meta {
+  font-size: 0.8em;
+  color: var(--text-faint);
+  margin-top: 6px;
+}
+
+.bridge-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* Button row */
+.bridge-btn-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+/* Extension grid */
+.ext-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0 16px;
+}
+
+.ext-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.85em;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-secondary);
+}
+
+.ext-checkbox:hover {
+  background: var(--background-modifier-hover);
+}
+
+.ext-checkbox input[type="checkbox"] {
+  margin: 0;
+}

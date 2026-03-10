@@ -1,0 +1,11 @@
+{
+  "id": "external-bridge",
+  "name": "External Bridge",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Link large external folders (PDFs, media, etc.) to your vault using lightweight placeholder notes — without importing files or affecting Obsidian Sync size limits.",
+  "author": "bramzilla",
+  "authorUrl": "https://github.com/bramzilla",
+  "fundingUrl": "",
+  "isDesktopOnly": true
+}
