@@ -621,8 +621,14 @@ export default class ExternalBridgePlugin extends Plugin {
 			};
 			this.settings.syncLog.unshift(entry); // newest first
 			const cap = this.settings.maxLogEntries;
-			if (cap > 0 && this.settings.syncLog.length > cap) {
-				this.settings.syncLog = this.settings.syncLog.slice(0, cap);
+			if (cap > 0) {
+				// Count entries for this specific bridge, keep only the newest `cap` of them
+				let bridgeCount = 0;
+				this.settings.syncLog = this.settings.syncLog.filter((e) => {
+					if (e.bridgeId !== bridge.id) return true; // keep other bridges untouched
+					bridgeCount++;
+					return bridgeCount <= cap;
+				});
 			}
 		}
 
@@ -1078,8 +1084,13 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 					const n = parseInt(raw);
 					if (isNaN(n) || n < 0) return;
 					this.plugin.settings.maxLogEntries = n;
-					if (n > 0 && this.plugin.settings.syncLog.length > n) {
-						this.plugin.settings.syncLog = this.plugin.settings.syncLog.slice(0, n);
+					if (n > 0) {
+						// Trim per-bridge so each bridge keeps at most n entries
+						const counts: Record<string, number> = {};
+						this.plugin.settings.syncLog = this.plugin.settings.syncLog.filter((e) => {
+							counts[e.bridgeId] = (counts[e.bridgeId] ?? 0) + 1;
+							return counts[e.bridgeId] <= n;
+						});
 					}
 					await this.plugin.saveSettings();
 				};
