@@ -145,7 +145,8 @@ function buildMetaBody(
 	const fileName = path.basename(filePath);
 	const ext = path.extname(fileName).slice(1).toLowerCase();
 	const stat = getFileStat(filePath);
-	const obsidianUri = `obsidian://open?path=${encodeURIComponent(filePath)}`;
+	// Use file:// URI so the OS opens it in the default application
+	const obsidianUri = `file://${filePath.replace(/\\/g, "/").replace(/ /g, "%20")}`;
 
 	let previewBlock = "";
 	if (ext === "pdf") {
