@@ -342,7 +342,7 @@ class FolderWatcher {
 // ─── Main Plugin ──────────────────────────────────────────────────────────────
 
 export default class ExternalBridgePlugin extends Plugin {
-	settings: ExternalBridgeSettings;
+	settings!: ExternalBridgeSettings;
 	private watchers: Map<string, FolderWatcher> = new Map(); // bridge.id → watcher
 
 	async onload() {
