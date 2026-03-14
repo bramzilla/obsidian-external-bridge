@@ -1,7 +1,8 @@
-/* External Bridge Plugin Styles */
+/* External Bridge Plugin Styles — v1.1 */
 
 .external-bridge-modal {
   padding: 8px;
+  min-width: 520px;
 }
 
 .external-bridge-modal .bridge-subtitle {
@@ -17,7 +18,8 @@
   padding: 24px 0;
 }
 
-/* Bridge list */
+/* ── Bridge list ─────────────────────────────────────────────── */
+
 .bridge-list {
   display: flex;
   flex-direction: column;
@@ -30,14 +32,54 @@
   border-radius: 8px;
   padding: 14px 16px;
   background: var(--background-secondary);
+  transition: border-color 0.15s ease;
 }
+
+.bridge-card:hover {
+  border-color: var(--interactive-accent);
+}
+
+/* ── Card header ─────────────────────────────────────────────── */
 
 .bridge-card-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
+  gap: 8px;
   margin-bottom: 6px;
 }
+
+.bridge-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Watcher status dot */
+.bridge-watch-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.bridge-watch-dot.active {
+  background: #4caf7d;
+  box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.25);
+  animation: pulse-dot 2.5s ease-in-out infinite;
+}
+
+.bridge-watch-dot.inactive {
+  background: var(--text-faint);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.25); }
+  50%       { box-shadow: 0 0 0 5px rgba(76, 175, 80, 0.08); }
+}
+
+/* ── Badges ──────────────────────────────────────────────────── */
 
 .bridge-badges {
   display: flex;
@@ -50,10 +92,12 @@
   color: var(--text-on-accent);
   padding: 1px 6px;
   border-radius: 4px;
-  font-size: 0.7em;
+  font-size: 0.68em;
   font-weight: 600;
   letter-spacing: 0.05em;
 }
+
+/* ── Paths & meta ────────────────────────────────────────────── */
 
 .bridge-path {
   font-family: var(--font-monospace);
@@ -69,13 +113,23 @@
   margin-top: 6px;
 }
 
+/* ── Actions ─────────────────────────────────────────────────── */
+
 .bridge-actions {
   display: flex;
   gap: 8px;
   margin-top: 10px;
+  flex-wrap: wrap;
 }
 
-/* Button row */
+/* Active watch button gets a subtle tint */
+.bridge-actions button.mod-active {
+  background: rgba(76, 175, 80, 0.12);
+  border-color: rgba(76, 175, 80, 0.4);
+}
+
+/* ── Bottom button row ───────────────────────────────────────── */
+
 .bridge-btn-row {
   display: flex;
   gap: 10px;
@@ -84,7 +138,8 @@
   border-top: 1px solid var(--background-modifier-border);
 }
 
-/* Extension grid */
+/* ── Extension grid ──────────────────────────────────────────── */
+
 .ext-grid {
   display: flex;
   flex-wrap: wrap;
@@ -95,14 +150,16 @@
 .ext-checkbox {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   cursor: pointer;
   user-select: none;
-  font-size: 0.85em;
-  padding: 4px 8px;
+  font-size: 0.82em;
+  font-weight: 500;
+  padding: 4px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 4px;
+  border-radius: 5px;
   background: var(--background-secondary);
+  transition: background 0.1s, border-color 0.1s;
 }
 
 .ext-checkbox:hover {
@@ -111,4 +168,5 @@
 
 .ext-checkbox input[type="checkbox"] {
   margin: 0;
+  accent-color: var(--interactive-accent);
 }
