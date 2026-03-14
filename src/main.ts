@@ -409,15 +409,14 @@ export default class ExternalBridgePlugin extends Plugin {
 
 		this.addSettingTab(new ExternalBridgeSettingTab(this.app, this));
 
-		if (this.settings.openOnSync) {
-			this.app.workspace.onLayoutReady(() => {
-				new BridgeManagerModal(this.app, this).open();
-			});
-		}
-
-		// Start watchers and run health checks on layout ready
+		// Single onLayoutReady: watchers first, modal last so dots render correctly
 		this.app.workspace.onLayoutReady(async () => {
-			// Health check — warn about unreachable bridges
+			// 1. Start watchers — must happen before modal opens so status dots are correct
+			for (const bridge of this.settings.bridges) {
+				if (bridge.watchEnabled) this.startWatcher(bridge);
+			}
+
+			// 2. Health check — warn about unreachable bridges
 			const unreachable = this.settings.bridges.filter(
 				(b) => checkBridgeHealth(b) === "unreachable"
 			);
@@ -429,7 +428,7 @@ export default class ExternalBridgePlugin extends Plugin {
 				);
 			}
 
-			// Auto-sync
+			// 3. Auto-sync
 			if (this.settings.autoSyncOnStartup && this.settings.bridges.length > 0) {
 				const reachable = this.settings.bridges.filter(
 					(b) => checkBridgeHealth(b) === "ok"
@@ -443,9 +442,9 @@ export default class ExternalBridgePlugin extends Plugin {
 				}
 			}
 
-			// Start watchers for any bridge that has watching enabled
-			for (const bridge of this.settings.bridges) {
-				if (bridge.watchEnabled) this.startWatcher(bridge);
+			// 4. Open Bridge Manager last — watchers are running so dots are correct
+			if (this.settings.openOnSync) {
+				new BridgeManagerModal(this.app, this).open();
 			}
 		});
 	}
@@ -463,6 +462,15 @@ export default class ExternalBridgePlugin extends Plugin {
 		}
 		if (!this.settings.syncLog) this.settings.syncLog = [];
 		if (this.settings.maxLogEntries === undefined) this.settings.maxLogEntries = 0;
+		// Trim existing log entries to cap on load
+		const capOnLoad = this.settings.maxLogEntries;
+		if (capOnLoad > 0) {
+			const counts: Record<string, number> = {};
+			this.settings.syncLog = this.settings.syncLog.filter((e) => {
+				counts[e.bridgeId] = (counts[e.bridgeId] ?? 0) + 1;
+				return counts[e.bridgeId] <= capOnLoad;
+			});
+		}
 	}
 
 	async saveSettings() {
