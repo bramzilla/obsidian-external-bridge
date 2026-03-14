@@ -1068,22 +1068,24 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Sync log limit")
-			.setDesc("Maximum number of sync entries to keep per bridge. Set to 0 to keep all entries indefinitely.")
-			.addText((t) =>
+			.setDesc("Maximum number of sync entries to keep per bridge. Set to 0 to keep all entries indefinitely. Press Enter or click away to apply.")
+			.addText((t) => {
 				t.setValue(String(this.plugin.settings.maxLogEntries))
-				 .setPlaceholder("0 = unlimited")
-				 .onChange(async (v) => {
-					const n = parseInt(v);
-					if (!isNaN(n) && n >= 0) {
-						this.plugin.settings.maxLogEntries = n;
-						// Trim existing log if new cap is lower
-						if (n > 0 && this.plugin.settings.syncLog.length > n) {
-							this.plugin.settings.syncLog = this.plugin.settings.syncLog.slice(0, n);
-						}
-						await this.plugin.saveSettings();
+				 .setPlaceholder("0 = unlimited");
+				// Apply only on blur (click away) or Enter — avoids trimming mid-keystroke
+				const applyLimit = async () => {
+					const raw = t.getValue().trim();
+					const n = parseInt(raw);
+					if (isNaN(n) || n < 0) return;
+					this.plugin.settings.maxLogEntries = n;
+					if (n > 0 && this.plugin.settings.syncLog.length > n) {
+						this.plugin.settings.syncLog = this.plugin.settings.syncLog.slice(0, n);
 					}
-				 })
-			);
+					await this.plugin.saveSettings();
+				};
+				t.inputEl.addEventListener("blur", applyLimit);
+				t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") applyLimit(); });
+			});
 
 		new Setting(containerEl)
 			.setName("Auto-sync on startup")
