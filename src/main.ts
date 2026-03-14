@@ -25,6 +25,17 @@ interface BridgedFolder {
 	recursive: boolean;
 	lastSynced: string | null;
 	watchEnabled: boolean;
+	customProperties: Record<string, string>; // key → value, injected into every placeholder
+}
+
+interface SyncLogEntry {
+	timestamp: string;       // ISO string
+	bridgeId: string;
+	bridgeLabel: string;
+	created: string[];       // file names
+	updated: string[];
+	removed: string[];
+	skipped: number;         // count only, not stored per-file
 }
 
 interface ExternalBridgeSettings {
@@ -33,7 +44,10 @@ interface ExternalBridgeSettings {
 	openOnSync: boolean;
 	watchDebounceMs: number;
 	autoSyncOnStartup: boolean;
+	syncLog: SyncLogEntry[];   // capped at MAX_LOG_ENTRIES
 }
+
+const MAX_LOG_ENTRIES = 50;
 
 // Health status for a bridge path
 type BridgeHealth = "ok" | "unreachable" | "unknown";
@@ -65,6 +79,7 @@ const DEFAULT_SETTINGS: ExternalBridgeSettings = {
 	openOnSync: false,
 	watchDebounceMs: 2000,
 	autoSyncOnStartup: false,
+	syncLog: [],
 };
 
 const SUPPORTED_EXTENSIONS = [
@@ -142,6 +157,7 @@ external-modified: "${stat ? stat.mtime : "unknown"}"
 external-mtime-ms: ${stat ? stat.mtimeMs : 0}
 bridge-id: "${bridge.id}"
 bridge-label: "${bridge.label}"
+${Object.entries(bridge.customProperties ?? {}).map(([k, v]) => `${k}: "${v}"`).join("\n")}
 tags:
 ${allTags}
 ---`;
@@ -440,10 +456,12 @@ export default class ExternalBridgePlugin extends Plugin {
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-		// Back-fill watchEnabled for existing bridges that pre-date this field
+		// Back-fill fields for bridges that pre-date them
 		for (const b of this.settings.bridges) {
 			if (b.watchEnabled === undefined) b.watchEnabled = false;
+			if (b.customProperties === undefined) b.customProperties = {};
 		}
+		if (!this.settings.syncLog) this.settings.syncLog = [];
 	}
 
 	async saveSettings() {
@@ -556,7 +574,10 @@ export default class ExternalBridgePlugin extends Plugin {
 
 		const externalFiles = getFilesRecursive(bridge.externalPath, bridge.includedExtensions, bridge.recursive);
 
-		let created = 0, updated = 0, skipped = 0, removed = 0;
+		let skipped = 0;
+		const createdFiles: string[] = [];
+		const updatedFiles: string[] = [];
+		const removedFiles: string[] = [];
 		const expectedPaths = new Set<string>();
 
 		for (const externalFile of externalFiles) {
@@ -565,8 +586,9 @@ export default class ExternalBridgePlugin extends Plugin {
 			expectedPaths.add(vaultPath);
 
 			const result = await this.upsertPlaceholder(bridge, externalFile, vaultPath);
-			if (result === "created") created++;
-			else if (result === "updated") updated++;
+			const name = path.basename(externalFile);
+			if (result === "created") createdFiles.push(name);
+			else if (result === "updated") updatedFiles.push(name);
 			else skipped++;
 		}
 
@@ -578,16 +600,36 @@ export default class ExternalBridgePlugin extends Plugin {
 				if (!expectedPaths.has(file.path)) {
 					const bridgeId = await this.getBridgeIdFromFile(file.path);
 					if (bridgeId === bridge.id) {
+						removedFiles.push(path.basename(file.path));
 						await this.app.vault.delete(file);
-						removed++;
 					}
 				}
+			}
+		}
+
+		// Write log entry (only if something actually happened)
+		if (createdFiles.length > 0 || updatedFiles.length > 0 || removedFiles.length > 0) {
+			const entry: SyncLogEntry = {
+				timestamp: new Date().toISOString(),
+				bridgeId: bridge.id,
+				bridgeLabel: bridge.label,
+				created: createdFiles,
+				updated: updatedFiles,
+				removed: removedFiles,
+				skipped,
+			};
+			this.settings.syncLog.unshift(entry); // newest first
+			if (this.settings.syncLog.length > MAX_LOG_ENTRIES) {
+				this.settings.syncLog = this.settings.syncLog.slice(0, MAX_LOG_ENTRIES);
 			}
 		}
 
 		bridge.lastSynced = new Date().toISOString();
 		await this.saveSettings();
 
+		const created = createdFiles.length;
+		const updated = updatedFiles.length;
+		const removed = removedFiles.length;
 		return { created, updated, skipped, removed };
 	}
 
@@ -746,6 +788,9 @@ class BridgeManagerModal extends Modal {
 			this.render();
 		};
 
+		const logBtn = actions.createEl("button", { text: "📋 Log" });
+		logBtn.onclick = () => new SyncLogModal(this.app, this.plugin, bridge).open();
+
 		const removeBtn = actions.createEl("button", { text: "Remove", cls: "mod-warning" });
 		removeBtn.onclick = async () => {
 			this.plugin.stopWatcher(bridge.id);
@@ -771,6 +816,7 @@ class AddBridgeModal extends Modal {
 	selectedExtensions: Set<string> = new Set(["pdf"]);
 	recursive = true;
 	watchEnabled = false;
+	customPropertiesRaw = ""; // raw textarea value, "key: value" per line
 
 	constructor(app: App, plugin: ExternalBridgePlugin, onSave: () => void) {
 		super(app);
@@ -815,6 +861,16 @@ class AddBridgeModal extends Modal {
 			.addToggle((t) => t.setValue(this.recursive).onChange((v) => (this.recursive = v)));
 
 		new Setting(contentEl)
+			.setName("Custom properties")
+			.setDesc("Extra frontmatter fields added to every placeholder in this bridge. One per line, format: key: value");
+		const customPropArea = contentEl.createEl("textarea", {
+			cls: "bridge-custom-props-textarea",
+			attr: { placeholder: "subject: music\nstatus: unreviewed\nnotebook: LittleBlackie" },
+		}) as HTMLTextAreaElement;
+		customPropArea.value = this.customPropertiesRaw;
+		customPropArea.oninput = () => { this.customPropertiesRaw = customPropArea.value; };
+
+		new Setting(contentEl)
 			.setName("Enable file watcher")
 			.setDesc("Automatically update placeholders when external files are added, changed, or deleted")
 			.addToggle((t) => t.setValue(this.watchEnabled).onChange((v) => (this.watchEnabled = v)));
@@ -831,6 +887,15 @@ class AddBridgeModal extends Modal {
 				return;
 			}
 
+			const customProperties: Record<string, string> = {};
+			for (const line of this.customPropertiesRaw.split("\n")) {
+				const idx = line.indexOf(":");
+				if (idx === -1) continue;
+				const k = line.slice(0, idx).trim();
+				const v = line.slice(idx + 1).trim();
+				if (k) customProperties[k] = v;
+			}
+
 			const bridge: BridgedFolder = {
 				id: generateId(),
 				label: this.label,
@@ -840,6 +905,7 @@ class AddBridgeModal extends Modal {
 				recursive: this.recursive,
 				lastSynced: null,
 				watchEnabled: this.watchEnabled,
+				customProperties,
 			};
 
 			this.plugin.settings.bridges.push(bridge);
@@ -856,6 +922,103 @@ class AddBridgeModal extends Modal {
 
 		const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
 		cancelBtn.onclick = () => this.close();
+	}
+
+	onClose() { this.contentEl.empty(); }
+}
+
+
+// ─── Sync Log Modal ───────────────────────────────────────────────────────────
+
+class SyncLogModal extends Modal {
+	plugin: ExternalBridgePlugin;
+	bridge: BridgedFolder;
+
+	constructor(app: App, plugin: ExternalBridgePlugin, bridge: BridgedFolder) {
+		super(app);
+		this.plugin = plugin;
+		this.bridge = bridge;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass("external-bridge-modal", "sync-log-modal");
+
+		contentEl.createEl("h2", { text: `📋 Sync Log — ${this.bridge.label}` });
+
+		const entries = this.plugin.settings.syncLog.filter(
+			(e) => e.bridgeId === this.bridge.id
+		);
+
+		if (entries.length === 0) {
+			contentEl.createEl("p", {
+				text: "No sync history yet. Run a sync to start logging.",
+				cls: "bridge-empty",
+			});
+			return;
+		}
+
+		const list = contentEl.createDiv("sync-log-list");
+
+		for (const entry of entries) {
+			const row = list.createDiv("sync-log-row");
+
+			// ── Summary line (always visible, acts as toggle) ──────────────
+			const summary = row.createDiv("sync-log-summary");
+			const dt = new Date(entry.timestamp);
+			const dateStr = dt.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+			const timeStr = dt.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+			summary.createEl("span", { text: `↻ ${dateStr}, ${timeStr}`, cls: "sync-log-date" });
+
+			const badges = summary.createDiv("sync-log-badges");
+			if (entry.created.length > 0)
+				badges.createEl("span", { text: `+${entry.created.length}`, cls: "sync-log-badge created" });
+			if (entry.updated.length > 0)
+				badges.createEl("span", { text: `~${entry.updated.length}`, cls: "sync-log-badge updated" });
+			if (entry.removed.length > 0)
+				badges.createEl("span", { text: `−${entry.removed.length}`, cls: "sync-log-badge removed" });
+			if (entry.skipped > 0)
+				badges.createEl("span", { text: `⊘${entry.skipped}`, cls: "sync-log-badge skipped" });
+
+			// ── Detail section (collapsed by default) ─────────────────────
+			const detail = row.createDiv("sync-log-detail");
+			detail.style.display = "none";
+
+			const renderGroup = (label: string, files: string[], cls: string) => {
+				if (files.length === 0) return;
+				const group = detail.createDiv(`sync-log-group ${cls}`);
+				group.createEl("div", { text: label, cls: "sync-log-group-label" });
+				for (const f of files) {
+					group.createEl("div", { text: f, cls: "sync-log-file" });
+				}
+			};
+
+			renderGroup("Created", entry.created, "created");
+			renderGroup("Updated", entry.updated, "updated");
+			renderGroup("Removed", entry.removed, "removed");
+
+			// Toggle on click
+			let expanded = false;
+			summary.style.cursor = "pointer";
+			summary.onclick = () => {
+				expanded = !expanded;
+				detail.style.display = expanded ? "block" : "none";
+				row.toggleClass("expanded", expanded);
+			};
+		}
+
+		// Clear log button
+		const footer = contentEl.createDiv("bridge-btn-row");
+		const clearBtn = footer.createEl("button", { text: "Clear log for this bridge", cls: "mod-warning" });
+		clearBtn.onclick = async () => {
+			this.plugin.settings.syncLog = this.plugin.settings.syncLog.filter(
+				(e) => e.bridgeId !== this.bridge.id
+			);
+			await this.plugin.saveSettings();
+			this.onOpen();
+		};
 	}
 
 	onClose() { this.contentEl.empty(); }
