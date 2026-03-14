@@ -1,6 +1,6 @@
 {
   "name": "obsidian-external-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Link external folders to your Obsidian vault via lightweight placeholder notes",
   "main": "main.js",
   "scripts": {

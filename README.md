@@ -33,9 +33,11 @@ Your 2 GB folder stays exactly where it is. Your vault only gains a handful of t
 
 - 🔗 **Link any external folder** — PDFs, images, audio, video, and more
 - 🏷️ **Full metadata support** — tags, properties, all Obsidian frontmatter works normally
-- 🔄 **Sync on demand** — create, update, and remove stale placeholders in one click
+- 👁️ **File watcher** — automatically creates/updates/removes placeholders when external files change
+- 💾 **User content preserved** — notes and links you write in a placeholder survive re-syncs
+- 🔄 **Smart sync** — skips unchanged files (mtime-based), so large folders sync fast
 - 📁 **Recursive** — mirrors your folder hierarchy inside the vault
-- 🎛️ **Configurable per bridge** — different file types and vault destinations per folder
+- 🎛️ **Configurable per bridge** — different file types, vault destinations, watch settings per folder
 - 🧹 **Cleans up stale placeholders** — when external files are deleted
 - 🖼️ **Image previews** — inline preview for image files
 - 🔒 **Desktop only** — uses Node.js `fs` for file system access
@@ -74,6 +76,7 @@ Click **+ Add Bridge** and fill in:
 | **Vault folder** | Where placeholders go inside your vault |
 | **File types** | Which extensions to create placeholders for |
 | **Include subfolders** | Mirror the folder structure recursively |
+| **Enable file watcher** | Auto-update placeholders when external files change |
 
 ### 2. Sync
 
@@ -81,19 +84,44 @@ Click **↻ Sync** on the bridge card (or **↻ Sync All**) to generate all plac
 
 ### 3. Organise
 
-Each file in your external folder now appears as a normal note inside your vault. You can add tags, properties, links, and your own notes freely.
+Each file in your external folder now appears as a normal note inside your vault. You can add tags, properties, links, and your own notes freely in the **user content zone** — they will never be overwritten on re-sync.
+
+### 4. User Content Zone
+
+Every placeholder contains a clearly marked zone for your own content:
+
+```
+<!-- bridge:user-content:start -->
+Your notes, links, and tags go here.
+They are NEVER overwritten on re-sync.
+<!-- bridge:user-content:end -->
+```
+
+Everything above that zone (frontmatter, file info table, preview) is regenerated automatically. Everything inside is yours.
+
+### 5. File Watcher
+
+Enable **👁 Watch** on a bridge to have the plugin watch the external folder in real time:
+
+- New file added → placeholder created
+- File modified → placeholder meta updated, your notes preserved
+- File deleted → placeholder removed
+
+A **pulsing green dot** on the bridge card shows the watcher is active. Watchers restart automatically when Obsidian reopens.
 
 ---
 
 ## Example Placeholder
 
 ```markdown
+<!-- bridge:meta:start -->
 ---
 external-path: "/Users/bram/Documents/Notes/session-2024-03-01.pdf"
 external-file: "session-2024-03-01.pdf"
 external-type: "pdf"
 external-size: "4.2 MB"
 external-modified: "2024-03-01"
+external-mtime-ms: 1709251200000
 bridge-id: "a3f9bc12"
 bridge-label: "Handwritten Notes"
 tags:
@@ -104,7 +132,36 @@ tags:
 # session-2024-03-01.pdf
 
 [→ Open in system viewer](...)
+<!-- bridge:meta:end -->
+
+<!-- bridge:user-content:start -->
+## My Notes
+
+Links to [[Algebra MOC]]. Covers quadratic equations, pages 3–7.
+
+#review #math
+<!-- bridge:user-content:end -->
 ```
+
+---
+
+## Settings
+
+| Setting | Description |
+|---|---|
+| **Default tags** | Tags automatically added to all placeholder files |
+| **Watcher debounce (ms)** | Wait time after a file event before acting (default: 2000ms) |
+| **Open on startup** | Show Bridge Manager when Obsidian opens |
+
+---
+
+## Roadmap
+
+- [ ] PDF first-page thumbnail preview
+- [ ] One-click import of selected files into vault
+- [ ] Bridge health check (warn when external path is unreachable)
+- [ ] Export/import bridge config across machines
+- [ ] Dataview example queries in docs
 
 ---
 

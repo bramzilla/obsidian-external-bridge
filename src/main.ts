@@ -6,6 +6,7 @@ import {
 	PluginSettingTab,
 	Setting,
 	TFolder,
+	TFile,
 	normalizePath,
 	FileSystemAdapter,
 } from "obsidian";
@@ -23,13 +24,24 @@ interface BridgedFolder {
 	includedExtensions: string[];
 	recursive: boolean;
 	lastSynced: string | null;
+	watchEnabled: boolean;
 }
 
 interface ExternalBridgeSettings {
 	bridges: BridgedFolder[];
 	defaultTags: string[];
 	openOnSync: boolean;
+	watchDebounceMs: number;
 }
+
+// User content is stored between the two sentinels in each placeholder note.
+// Everything outside those sentinels is regenerated on sync.
+const USER_CONTENT_START = "<!-- bridge:user-content:start -->";
+const USER_CONTENT_END   = "<!-- bridge:user-content:end -->";
+
+// Marks the auto-generated metadata block so we can reliably replace it.
+const META_START = "<!-- bridge:meta:start -->";
+const META_END   = "<!-- bridge:meta:end -->";
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -37,9 +49,15 @@ const DEFAULT_SETTINGS: ExternalBridgeSettings = {
 	bridges: [],
 	defaultTags: [],
 	openOnSync: false,
+	watchDebounceMs: 2000,
 };
 
-const SUPPORTED_EXTENSIONS = ["pdf", "png", "jpg", "jpeg", "gif", "mp3", "mp4", "mov", "docx", "xlsx", "txt", "md"];
+const SUPPORTED_EXTENSIONS = [
+	"pdf", "png", "jpg", "jpeg", "gif", "webp",
+	"mp3", "mp4", "mov", "m4a",
+	"docx", "xlsx", "pptx",
+	"txt", "md",
+];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -50,7 +68,6 @@ function generateId(): string {
 function getFilesRecursive(dir: string, extensions: string[], recursive: boolean): string[] {
 	const results: string[] = [];
 	if (!fs.existsSync(dir)) return results;
-
 	const entries = fs.readdirSync(dir, { withFileTypes: true });
 	for (const entry of entries) {
 		const fullPath = path.join(dir, entry.name);
@@ -73,46 +90,56 @@ function formatFileSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-function getFileStat(filePath: string): { size: number; mtime: string } | null {
+function getFileStat(filePath: string): { size: number; mtime: string; mtimeMs: number } | null {
 	try {
 		const stat = fs.statSync(filePath);
 		return {
 			size: stat.size,
 			mtime: stat.mtime.toISOString().split("T")[0],
+			mtimeMs: stat.mtimeMs,
 		};
 	} catch {
 		return null;
 	}
 }
 
-function buildPlaceholderContent(
+// ─── Content building ─────────────────────────────────────────────────────────
+
+/**
+ * Build only the auto-generated metadata block. This block is wrapped in
+ * META_START / META_END sentinels so it can be replaced in isolation on
+ * subsequent syncs without touching the user's content section.
+ */
+function buildMetaBlock(
 	filePath: string,
-	vaultRelativePath: string,
 	bridge: BridgedFolder,
 	defaultTags: string[]
 ): string {
 	const fileName = path.basename(filePath);
 	const ext = path.extname(fileName).slice(1).toLowerCase();
 	const stat = getFileStat(filePath);
-	const allTags = [...defaultTags, ext, "external-bridge"].map((t) => `  - ${t}`).join("\n");
-
+	const allTags = [...new Set([...defaultTags, ext, "external-bridge"])].map((t) => `  - ${t}`).join("\n");
 	const obsidianUri = `obsidian://open?path=${encodeURIComponent(filePath)}`;
 
-	let viewBlock = "";
-	if (["pdf"].includes(ext)) {
-		viewBlock = `\n## Preview\n\n> [!info] External File\n> This file lives outside your vault and is not synced.\n> [Open in system viewer](${obsidianUri})\n\n\`\`\`dataview\n\`\`\`\n`;
+	let previewBlock = "";
+	if (ext === "pdf") {
+		previewBlock = `\n> [!info] External PDF\n> This file is stored outside your vault and is not synced.\n> [→ Open in system viewer](${obsidianUri})\n`;
 	} else if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
-		viewBlock = `\n## Preview\n\n![${fileName}](${filePath})\n`;
+		previewBlock = `\n![${fileName}](${filePath})\n`;
+	} else if (["mp3", "mp4", "mov", "m4a"].includes(ext)) {
+		previewBlock = `\n> [!info] External Media\n> [→ Open in system viewer](${obsidianUri})\n`;
 	} else {
-		viewBlock = `\n## File\n\n> [!info] External File — not synced\n> [Open in system viewer](${obsidianUri})\n`;
+		previewBlock = `\n> [!info] External File\n> [→ Open in system viewer](${obsidianUri})\n`;
 	}
 
-	return `---
+	return `${META_START}
+---
 external-path: "${filePath.replace(/\\/g, "/")}"
 external-file: "${fileName}"
 external-type: "${ext}"
 external-size: "${stat ? formatFileSize(stat.size) : "unknown"}"
 external-modified: "${stat ? stat.mtime : "unknown"}"
+external-mtime-ms: ${stat ? stat.mtimeMs : 0}
 bridge-id: "${bridge.id}"
 bridge-label: "${bridge.label}"
 tags:
@@ -121,25 +148,202 @@ ${allTags}
 
 # ${fileName}
 
-| Property | Value |
+| | |
 |---|---|
-| **File** | \`${fileName}\` |
 | **Type** | ${ext.toUpperCase()} |
 | **Size** | ${stat ? formatFileSize(stat.size) : "unknown"} |
 | **Modified** | ${stat ? stat.mtime : "unknown"} |
 | **Source** | \`${filePath}\` |
 
 [→ Open in system viewer](${obsidianUri})
-${viewBlock}
+${previewBlock}
+${META_END}`;
+}
+
+/**
+ * Build the full placeholder for a brand-new file (no existing user content).
+ */
+function buildFullPlaceholder(
+	filePath: string,
+	bridge: BridgedFolder,
+	defaultTags: string[]
+): string {
+	const metaBlock = buildMetaBlock(filePath, bridge, defaultTags);
+	return `${metaBlock}
+
+${USER_CONTENT_START}
+<!-- Add your notes, links, and tags below this line. They will be preserved on re-sync. -->
+
+${USER_CONTENT_END}
+
 ---
-*Managed by External Bridge plugin. Do not remove frontmatter.*
+*Managed by External Bridge · Do not remove the sentinel comments above.*
 `;
+}
+
+/**
+ * Given the current content of an existing placeholder, replace only the
+ * auto-generated meta block while leaving the user's content untouched.
+ * If sentinel markers are missing (e.g. old format), fall back to a full
+ * rebuild and inject a user-content block at the end.
+ */
+function mergeUpdatedContent(
+	existingContent: string,
+	filePath: string,
+	bridge: BridgedFolder,
+	defaultTags: string[]
+): string {
+	const metaBlock = buildMetaBlock(filePath, bridge, defaultTags);
+
+	const metaStartIdx = existingContent.indexOf(META_START);
+	const metaEndIdx   = existingContent.indexOf(META_END);
+
+	if (metaStartIdx !== -1 && metaEndIdx !== -1) {
+		// Replace only the meta block
+		const before = existingContent.slice(0, metaStartIdx);
+		const after  = existingContent.slice(metaEndIdx + META_END.length);
+		return `${before}${metaBlock}${after}`;
+	}
+
+	// Legacy / missing sentinels — do a safe migration:
+	// Keep any content between the last --- and EOF as user content.
+	const userContentMatch = existingContent.match(/\n---\n[\s\S]*?Managed by External Bridge[\s\S]*$/);
+	const preservedUserContent = existingContent
+		.split(USER_CONTENT_START)[1]
+		?.split(USER_CONTENT_END)[0] ?? "";
+
+	return `${metaBlock}
+
+${USER_CONTENT_START}
+${preservedUserContent.trim() || "<!-- Add your notes, links, and tags below this line. They will be preserved on re-sync. -->"}
+
+${USER_CONTENT_END}
+
+---
+*Managed by External Bridge · Do not remove the sentinel comments above.*
+`;
+}
+
+// ─── File Watcher ─────────────────────────────────────────────────────────────
+
+type WatcherCallback = (event: "add" | "change" | "unlink", filePath: string) => void;
+
+class FolderWatcher {
+	private watcher: fs.FSWatcher | null = null;
+	private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+	private knownFiles: Map<string, number> = new Map(); // path → mtimeMs
+	private pollInterval: ReturnType<typeof setInterval> | null = null;
+
+	constructor(
+		private dir: string,
+		private extensions: string[],
+		private recursive: boolean,
+		private debounceMs: number,
+		private callback: WatcherCallback
+	) {}
+
+	start() {
+		this.stop();
+
+		// Seed known files
+		const initial = getFilesRecursive(this.dir, this.extensions, this.recursive);
+		for (const f of initial) {
+			const stat = getFileStat(f);
+			if (stat) this.knownFiles.set(f, stat.mtimeMs);
+		}
+
+		// Use Node's fs.watch where possible (fast, event-driven)
+		// Fall back to polling for network drives / edge cases
+		try {
+			this.watcher = fs.watch(
+				this.dir,
+				{ recursive: this.recursive, persistent: false },
+				(eventType, filename) => {
+					if (!filename) return;
+					// fs.watch gives relative paths on some platforms
+					const resolved = path.isAbsolute(filename)
+						? filename
+						: path.join(this.dir, filename);
+					const ext = path.extname(resolved).slice(1).toLowerCase();
+					if (this.extensions.length > 0 && !this.extensions.includes(ext)) return;
+					this.scheduleCheck(resolved);
+				}
+			);
+		} catch {
+			// fs.watch not available (e.g. network share) — use polling
+			this.startPolling();
+		}
+	}
+
+	private startPolling() {
+		this.pollInterval = setInterval(() => {
+			const current = getFilesRecursive(this.dir, this.extensions, this.recursive);
+			const currentSet = new Set(current);
+
+			// Detect new / changed
+			for (const f of current) {
+				const stat = getFileStat(f);
+				if (!stat) continue;
+				const known = this.knownFiles.get(f);
+				if (known === undefined) {
+					this.knownFiles.set(f, stat.mtimeMs);
+					this.scheduleCheck(f, "add");
+				} else if (stat.mtimeMs > known) {
+					this.knownFiles.set(f, stat.mtimeMs);
+					this.scheduleCheck(f, "change");
+				}
+			}
+
+			// Detect removed
+			for (const [f] of this.knownFiles) {
+				if (!currentSet.has(f)) {
+					this.knownFiles.delete(f);
+					this.callback("unlink", f);
+				}
+			}
+		}, 5000);
+	}
+
+	private scheduleCheck(filePath: string, hintEvent?: "add" | "change") {
+		const existing = this.debounceTimers.get(filePath);
+		if (existing) clearTimeout(existing);
+
+		const timer = setTimeout(() => {
+			this.debounceTimers.delete(filePath);
+			const exists = fs.existsSync(filePath);
+			if (!exists) {
+				this.knownFiles.delete(filePath);
+				this.callback("unlink", filePath);
+				return;
+			}
+			const stat = getFileStat(filePath);
+			if (!stat) return;
+			const known = this.knownFiles.get(filePath);
+			if (known === undefined) {
+				this.knownFiles.set(filePath, stat.mtimeMs);
+				this.callback(hintEvent ?? "add", filePath);
+			} else if (stat.mtimeMs > known) {
+				this.knownFiles.set(filePath, stat.mtimeMs);
+				this.callback("change", filePath);
+			}
+		}, this.debounceMs);
+
+		this.debounceTimers.set(filePath, timer);
+	}
+
+	stop() {
+		if (this.watcher) { this.watcher.close(); this.watcher = null; }
+		if (this.pollInterval) { clearInterval(this.pollInterval); this.pollInterval = null; }
+		for (const t of this.debounceTimers.values()) clearTimeout(t);
+		this.debounceTimers.clear();
+	}
 }
 
 // ─── Main Plugin ──────────────────────────────────────────────────────────────
 
 export default class ExternalBridgePlugin extends Plugin {
 	settings: ExternalBridgeSettings;
+	private watchers: Map<string, FolderWatcher> = new Map(); // bridge.id → watcher
 
 	async onload() {
 		await this.loadSettings();
@@ -162,15 +366,30 @@ export default class ExternalBridgePlugin extends Plugin {
 
 		this.addSettingTab(new ExternalBridgeSettingTab(this.app, this));
 
-		console.log("External Bridge plugin loaded.");
+		if (this.settings.openOnSync) {
+			this.app.workspace.onLayoutReady(() => {
+				new BridgeManagerModal(this.app, this).open();
+			});
+		}
+
+		// Start watchers for any bridge that has watching enabled
+		this.app.workspace.onLayoutReady(() => {
+			for (const bridge of this.settings.bridges) {
+				if (bridge.watchEnabled) this.startWatcher(bridge);
+			}
+		});
 	}
 
 	onunload() {
-		console.log("External Bridge plugin unloaded.");
+		this.stopAllWatchers();
 	}
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		// Back-fill watchEnabled for existing bridges that pre-date this field
+		for (const b of this.settings.bridges) {
+			if (b.watchEnabled === undefined) b.watchEnabled = false;
+		}
 	}
 
 	async saveSettings() {
@@ -179,67 +398,129 @@ export default class ExternalBridgePlugin extends Plugin {
 
 	getVaultBasePath(): string {
 		const adapter = this.app.vault.adapter;
-		if (adapter instanceof FileSystemAdapter) {
-			return adapter.getBasePath();
-		}
+		if (adapter instanceof FileSystemAdapter) return adapter.getBasePath();
 		return "";
 	}
 
-	async syncBridge(bridge: BridgedFolder): Promise<{ created: number; updated: number; removed: number }> {
-		const vaultBase = this.getVaultBasePath();
+	// ─── Watcher management ────────────────────────────────────────────────────
+
+	startWatcher(bridge: BridgedFolder) {
+		this.stopWatcher(bridge.id);
+
+		const watcher = new FolderWatcher(
+			bridge.externalPath,
+			bridge.includedExtensions,
+			bridge.recursive,
+			this.settings.watchDebounceMs,
+			async (event, filePath) => {
+				const vaultPath = this.externalPathToVaultPath(bridge, filePath);
+				if (!vaultPath) return;
+
+				if (event === "unlink") {
+					const file = this.app.vault.getAbstractFileByPath(vaultPath);
+					if (file instanceof TFile) {
+						await this.app.vault.delete(file);
+						new Notice(`External Bridge: removed placeholder for deleted file "${path.basename(filePath)}"`);
+					}
+				} else {
+					// add or change
+					await this.upsertPlaceholder(bridge, filePath, vaultPath);
+					new Notice(`External Bridge: ${event === "add" ? "created" : "updated"} "${path.basename(filePath)}"`);
+				}
+			}
+		);
+
+		watcher.start();
+		this.watchers.set(bridge.id, watcher);
+	}
+
+	stopWatcher(bridgeId: string) {
+		const w = this.watchers.get(bridgeId);
+		if (w) { w.stop(); this.watchers.delete(bridgeId); }
+	}
+
+	stopAllWatchers() {
+		for (const w of this.watchers.values()) w.stop();
+		this.watchers.clear();
+	}
+
+	// ─── Path helpers ──────────────────────────────────────────────────────────
+
+	externalPathToVaultPath(bridge: BridgedFolder, externalFile: string): string | null {
+		const ext = path.extname(externalFile).slice(1).toLowerCase();
+		if (bridge.includedExtensions.length > 0 && !bridge.includedExtensions.includes(ext)) return null;
+		const relativeToBridge = path.relative(bridge.externalPath, externalFile);
+		const placeholderRelative = relativeToBridge.replace(/\.[^.]+$/, ".md");
+		return normalizePath(path.join(bridge.vaultFolder, placeholderRelative));
+	}
+
+	// ─── Placeholder upsert ───────────────────────────────────────────────────
+
+	async upsertPlaceholder(
+		bridge: BridgedFolder,
+		externalFile: string,
+		vaultPath: string
+	): Promise<"created" | "updated" | "skipped"> {
+		// Ensure parent folder exists
+		const parentDir = vaultPath.substring(0, vaultPath.lastIndexOf("/"));
+		if (parentDir && !this.app.vault.getAbstractFileByPath(parentDir)) {
+			await this.app.vault.createFolder(parentDir);
+		}
+
+		const existing = this.app.vault.getAbstractFileByPath(vaultPath);
+
+		if (!existing) {
+			const content = buildFullPlaceholder(externalFile, bridge, this.settings.defaultTags);
+			await this.app.vault.create(vaultPath, content);
+			return "created";
+		}
+
+		// File exists — check if external file has actually changed since last write
+		const existingFile = existing as TFile;
+		const existingContent = await this.app.vault.read(existingFile);
+
+		// Extract stored mtime from frontmatter to avoid unnecessary rewrites
+		const storedMtimeMatch = existingContent.match(/external-mtime-ms:\s*(\d+)/);
+		const storedMtime = storedMtimeMatch ? parseInt(storedMtimeMatch[1]) : 0;
+		const stat = getFileStat(externalFile);
+
+		if (stat && stat.mtimeMs <= storedMtime) return "skipped";
+
+		const merged = mergeUpdatedContent(existingContent, externalFile, bridge, this.settings.defaultTags);
+		await this.app.vault.modify(existingFile, merged);
+		return "updated";
+	}
+
+	// ─── Sync ─────────────────────────────────────────────────────────────────
+
+	async syncBridge(bridge: BridgedFolder): Promise<{ created: number; updated: number; skipped: number; removed: number }> {
 		const targetVaultFolder = normalizePath(bridge.vaultFolder);
 
-		// Ensure vault folder exists
 		if (!this.app.vault.getAbstractFileByPath(targetVaultFolder)) {
 			await this.app.vault.createFolder(targetVaultFolder);
 		}
 
 		const externalFiles = getFilesRecursive(bridge.externalPath, bridge.includedExtensions, bridge.recursive);
 
-		let created = 0;
-		let updated = 0;
-		let removed = 0;
-
-		// Build map of expected placeholder paths
+		let created = 0, updated = 0, skipped = 0, removed = 0;
 		const expectedPaths = new Set<string>();
 
 		for (const externalFile of externalFiles) {
-			const relativeToBridge = path.relative(bridge.externalPath, externalFile);
-			const placeholderRelative = relativeToBridge.replace(/\.[^.]+$/, ".md");
-			const vaultPath = normalizePath(path.join(targetVaultFolder, placeholderRelative));
+			const vaultPath = this.externalPathToVaultPath(bridge, externalFile);
+			if (!vaultPath) continue;
 			expectedPaths.add(vaultPath);
 
-			const content = buildPlaceholderContent(
-				externalFile,
-				vaultPath,
-				bridge,
-				this.settings.defaultTags
-			);
-
-			const existing = this.app.vault.getAbstractFileByPath(vaultPath);
-			if (existing) {
-				// Update if external file changed
-				const stat = getFileStat(externalFile);
-				if (stat) {
-					await this.app.vault.modify(existing as any, content);
-					updated++;
-				}
-			} else {
-				// Create subfolder if needed
-				const parentDir = vaultPath.substring(0, vaultPath.lastIndexOf("/"));
-				if (parentDir && !this.app.vault.getAbstractFileByPath(parentDir)) {
-					await this.app.vault.createFolder(parentDir);
-				}
-				await this.app.vault.create(vaultPath, content);
-				created++;
-			}
+			const result = await this.upsertPlaceholder(bridge, externalFile, vaultPath);
+			if (result === "created") created++;
+			else if (result === "updated") updated++;
+			else skipped++;
 		}
 
-		// Remove stale placeholders (files that no longer exist externally)
+		// Remove stale placeholders
 		const folder = this.app.vault.getAbstractFileByPath(targetVaultFolder);
 		if (folder instanceof TFolder) {
-			const allPlaceholders = this.getAllMarkdownFiles(folder);
-			for (const file of allPlaceholders) {
+			const allFiles = this.getAllMarkdownFiles(folder);
+			for (const file of allFiles) {
 				if (!expectedPaths.has(file.path)) {
 					const bridgeId = await this.getBridgeIdFromFile(file.path);
 					if (bridgeId === bridge.id) {
@@ -250,35 +531,10 @@ export default class ExternalBridgePlugin extends Plugin {
 			}
 		}
 
-		// Update last synced
 		bridge.lastSynced = new Date().toISOString();
 		await this.saveSettings();
 
-		return { created, updated, removed };
-	}
-
-	getAllMarkdownFiles(folder: TFolder): any[] {
-		const results: any[] = [];
-		for (const child of folder.children) {
-			if (child instanceof TFolder) {
-				results.push(...this.getAllMarkdownFiles(child));
-			} else {
-				results.push(child);
-			}
-		}
-		return results;
-	}
-
-	async getBridgeIdFromFile(vaultPath: string): Promise<string | null> {
-		try {
-			const file = this.app.vault.getAbstractFileByPath(vaultPath) as any;
-			if (!file) return null;
-			const content = await this.app.vault.read(file);
-			const match = content.match(/bridge-id:\s*"([^"]+)"/);
-			return match ? match[1] : null;
-		} catch {
-			return null;
-		}
+		return { created, updated, skipped, removed };
 	}
 
 	async syncAllBridges() {
@@ -287,23 +543,38 @@ export default class ExternalBridgePlugin extends Plugin {
 			return;
 		}
 
-		new Notice("Syncing all bridges...");
-		let totalCreated = 0;
-		let totalUpdated = 0;
-		let totalRemoved = 0;
+		new Notice("Syncing all bridges…");
+		let tc = 0, tu = 0, tr = 0;
 
 		for (const bridge of this.settings.bridges) {
 			try {
-				const result = await this.syncBridge(bridge);
-				totalCreated += result.created;
-				totalUpdated += result.updated;
-				totalRemoved += result.removed;
+				const r = await this.syncBridge(bridge);
+				tc += r.created; tu += r.updated; tr += r.removed;
 			} catch (e) {
-				new Notice(`Error syncing bridge "${bridge.label}": ${e.message}`);
+				new Notice(`Error syncing "${bridge.label}": ${(e as Error).message}`);
 			}
 		}
 
-		new Notice(`Sync complete: ${totalCreated} created, ${totalUpdated} updated, ${totalRemoved} removed.`);
+		new Notice(`Sync complete — ${tc} created, ${tu} updated, ${tr} removed.`);
+	}
+
+	getAllMarkdownFiles(folder: TFolder): TFile[] {
+		const results: TFile[] = [];
+		for (const child of folder.children) {
+			if (child instanceof TFolder) results.push(...this.getAllMarkdownFiles(child));
+			else if (child instanceof TFile) results.push(child);
+		}
+		return results;
+	}
+
+	async getBridgeIdFromFile(vaultPath: string): Promise<string | null> {
+		try {
+			const file = this.app.vault.getAbstractFileByPath(vaultPath) as TFile;
+			if (!file) return null;
+			const content = await this.app.vault.read(file);
+			const match = content.match(/bridge-id:\s*"([^"]+)"/);
+			return match ? match[1] : null;
+		} catch { return null; }
 	}
 }
 
@@ -317,9 +588,7 @@ class BridgeManagerModal extends Modal {
 		this.plugin = plugin;
 	}
 
-	onOpen() {
-		this.render();
-	}
+	onOpen() { this.render(); }
 
 	render() {
 		const { contentEl } = this;
@@ -332,12 +601,8 @@ class BridgeManagerModal extends Modal {
 			cls: "bridge-subtitle",
 		});
 
-		// Bridge list
 		if (this.plugin.settings.bridges.length === 0) {
-			contentEl.createEl("p", {
-				text: "No bridges yet. Add one below.",
-				cls: "bridge-empty",
-			});
+			contentEl.createEl("p", { text: "No bridges yet. Add one below.", cls: "bridge-empty" });
 		} else {
 			const list = contentEl.createDiv("bridge-list");
 			for (const bridge of this.plugin.settings.bridges) {
@@ -345,39 +610,35 @@ class BridgeManagerModal extends Modal {
 			}
 		}
 
-		// Add bridge button
 		const btnRow = contentEl.createDiv("bridge-btn-row");
-
 		const addBtn = btnRow.createEl("button", { text: "+ Add Bridge", cls: "mod-cta" });
-		addBtn.onclick = () => {
-			new AddBridgeModal(this.app, this.plugin, () => this.render()).open();
-		};
+		addBtn.onclick = () => new AddBridgeModal(this.app, this.plugin, () => this.render()).open();
 
 		const syncAllBtn = btnRow.createEl("button", { text: "↻ Sync All" });
-		syncAllBtn.onclick = async () => {
-			this.close();
-			await this.plugin.syncAllBridges();
-		};
+		syncAllBtn.onclick = async () => { this.close(); await this.plugin.syncAllBridges(); };
 	}
 
 	renderBridgeCard(container: HTMLElement, bridge: BridgedFolder) {
 		const card = container.createDiv("bridge-card");
 
 		const header = card.createDiv("bridge-card-header");
-		header.createEl("strong", { text: bridge.label });
+		const titleRow = header.createDiv("bridge-card-title-row");
+		titleRow.createEl("strong", { text: bridge.label });
+
+		// Watcher status indicator
+		const watcherActive = this.plugin["watchers"].has(bridge.id);
+		const watchDot = titleRow.createEl("span", {
+			cls: `bridge-watch-dot ${watcherActive ? "active" : "inactive"}`,
+			title: watcherActive ? "File watcher active" : "File watcher off",
+		});
+
 		const badges = header.createDiv("bridge-badges");
 		bridge.includedExtensions.forEach((ext) => {
 			badges.createEl("span", { text: ext.toUpperCase(), cls: "bridge-badge" });
 		});
 
-		card.createEl("div", {
-			text: `External: ${bridge.externalPath}`,
-			cls: "bridge-path",
-		});
-		card.createEl("div", {
-			text: `Vault folder: ${bridge.vaultFolder}`,
-			cls: "bridge-path",
-		});
+		card.createEl("div", { text: `External: ${bridge.externalPath}`, cls: "bridge-path" });
+		card.createEl("div", { text: `Vault folder: ${bridge.vaultFolder}`, cls: "bridge-path" });
 		card.createEl("div", {
 			text: `Last synced: ${bridge.lastSynced ? new Date(bridge.lastSynced).toLocaleString() : "Never"}`,
 			cls: "bridge-meta",
@@ -388,20 +649,39 @@ class BridgeManagerModal extends Modal {
 		const syncBtn = actions.createEl("button", { text: "↻ Sync" });
 		syncBtn.onclick = async () => {
 			syncBtn.disabled = true;
-			syncBtn.setText("Syncing...");
+			syncBtn.setText("Syncing…");
 			try {
 				const result = await this.plugin.syncBridge(bridge);
-				new Notice(`"${bridge.label}" synced: ${result.created} created, ${result.updated} updated, ${result.removed} removed.`);
+				new Notice(`"${bridge.label}": ${result.created} created, ${result.updated} updated, ${result.skipped} skipped, ${result.removed} removed.`);
 				this.render();
 			} catch (e) {
-				new Notice(`Sync failed: ${e.message}`);
+				new Notice(`Sync failed: ${(e as Error).message}`);
 				syncBtn.disabled = false;
 				syncBtn.setText("↻ Sync");
 			}
 		};
 
+		// Watch toggle button
+		const watchBtn = actions.createEl("button", {
+			text: watcherActive ? "⏸ Stop Watch" : "👁 Watch",
+			cls: watcherActive ? "mod-active" : "",
+		});
+		watchBtn.onclick = async () => {
+			if (this.plugin["watchers"].has(bridge.id)) {
+				this.plugin.stopWatcher(bridge.id);
+				bridge.watchEnabled = false;
+			} else {
+				this.plugin.startWatcher(bridge);
+				bridge.watchEnabled = true;
+				new Notice(`Watching "${bridge.label}" for changes…`);
+			}
+			await this.plugin.saveSettings();
+			this.render();
+		};
+
 		const removeBtn = actions.createEl("button", { text: "Remove", cls: "mod-warning" });
 		removeBtn.onclick = async () => {
+			this.plugin.stopWatcher(bridge.id);
 			this.plugin.settings.bridges = this.plugin.settings.bridges.filter((b) => b.id !== bridge.id);
 			await this.plugin.saveSettings();
 			new Notice(`Bridge "${bridge.label}" removed. Placeholder files remain in your vault.`);
@@ -409,9 +689,7 @@ class BridgeManagerModal extends Modal {
 		};
 	}
 
-	onClose() {
-		this.contentEl.empty();
-	}
+	onClose() { this.contentEl.empty(); }
 }
 
 // ─── Add Bridge Modal ─────────────────────────────────────────────────────────
@@ -425,6 +703,7 @@ class AddBridgeModal extends Modal {
 	vaultFolder = "_ExternalBridge";
 	selectedExtensions: Set<string> = new Set(["pdf"]);
 	recursive = true;
+	watchEnabled = false;
 
 	constructor(app: App, plugin: ExternalBridgePlugin, onSave: () => void) {
 		super(app);
@@ -440,44 +719,38 @@ class AddBridgeModal extends Modal {
 		new Setting(contentEl)
 			.setName("Label")
 			.setDesc("A name for this bridge (e.g. Handwritten Notes)")
-			.addText((text) =>
-				text.setPlaceholder("My PDF Notes").onChange((v) => (this.label = v))
-			);
+			.addText((t) => t.setPlaceholder("My PDF Notes").onChange((v) => (this.label = v)));
 
 		new Setting(contentEl)
 			.setName("External folder path")
-			.setDesc("Absolute path to the folder on your disk (e.g. /Users/bram/Documents/Notes)")
-			.addText((text) =>
-				text.setPlaceholder("/path/to/folder").onChange((v) => (this.externalPath = v))
-			);
+			.setDesc("Absolute path to the folder on your disk")
+			.addText((t) => t.setPlaceholder("/path/to/folder").onChange((v) => (this.externalPath = v)));
 
 		new Setting(contentEl)
 			.setName("Vault folder")
 			.setDesc("Where to create placeholder files inside your vault")
-			.addText((text) =>
-				text.setValue(this.vaultFolder).onChange((v) => (this.vaultFolder = v))
-			);
+			.addText((t) => t.setValue(this.vaultFolder).onChange((v) => (this.vaultFolder = v)));
 
 		new Setting(contentEl).setName("File types").setDesc("Which file types to create placeholders for");
 
 		const extGrid = contentEl.createDiv("ext-grid");
 		for (const ext of SUPPORTED_EXTENSIONS) {
-			const label = extGrid.createEl("label", { cls: "ext-checkbox" });
-			const cb = label.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+			const lbl = extGrid.createEl("label", { cls: "ext-checkbox" });
+			const cb  = lbl.createEl("input", { type: "checkbox" }) as HTMLInputElement;
 			cb.checked = this.selectedExtensions.has(ext);
-			cb.onchange = () => {
-				if (cb.checked) this.selectedExtensions.add(ext);
-				else this.selectedExtensions.delete(ext);
-			};
-			label.createSpan({ text: ext.toUpperCase() });
+			cb.onchange = () => { if (cb.checked) this.selectedExtensions.add(ext); else this.selectedExtensions.delete(ext); };
+			lbl.createSpan({ text: ext.toUpperCase() });
 		}
 
 		new Setting(contentEl)
 			.setName("Include subfolders")
 			.setDesc("Recursively include files in subfolders")
-			.addToggle((toggle) =>
-				toggle.setValue(this.recursive).onChange((v) => (this.recursive = v))
-			);
+			.addToggle((t) => t.setValue(this.recursive).onChange((v) => (this.recursive = v)));
+
+		new Setting(contentEl)
+			.setName("Enable file watcher")
+			.setDesc("Automatically update placeholders when external files are added, changed, or deleted")
+			.addToggle((t) => t.setValue(this.watchEnabled).onChange((v) => (this.watchEnabled = v)));
 
 		const btnRow = contentEl.createDiv("bridge-btn-row");
 		const saveBtn = btnRow.createEl("button", { text: "Add Bridge", cls: "mod-cta" });
@@ -495,26 +768,30 @@ class AddBridgeModal extends Modal {
 				id: generateId(),
 				label: this.label,
 				externalPath: this.externalPath,
-				vaultFolder: normalizePath(this.vaultFolder + "/" + this.label),
+				vaultFolder: normalizePath(`${this.vaultFolder}/${this.label}`),
 				includedExtensions: [...this.selectedExtensions],
 				recursive: this.recursive,
 				lastSynced: null,
+				watchEnabled: this.watchEnabled,
 			};
 
 			this.plugin.settings.bridges.push(bridge);
 			await this.plugin.saveSettings();
+
+			if (this.watchEnabled) {
+				this.plugin.startWatcher(bridge);
+			}
+
 			this.close();
 			this.onSave();
-			new Notice(`Bridge "${this.label}" added! Run Sync to create placeholder files.`);
+			new Notice(`Bridge "${this.label}" added! Run Sync to create placeholders.`);
 		};
 
 		const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
 		cancelBtn.onclick = () => this.close();
 	}
 
-	onClose() {
-		this.contentEl.empty();
-	}
+	onClose() { this.contentEl.empty(); }
 }
 
 // ─── Settings Tab ─────────────────────────────────────────────────────────────
@@ -530,28 +807,37 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-
 		containerEl.createEl("h2", { text: "External Bridge Settings" });
 
 		new Setting(containerEl)
 			.setName("Default tags")
 			.setDesc("Comma-separated tags added to all placeholder files (e.g. source/external, review)")
-			.addText((text) =>
-				text
-					.setValue(this.plugin.settings.defaultTags.join(", "))
-					.onChange(async (v) => {
-						this.plugin.settings.defaultTags = v
-							.split(",")
-							.map((t) => t.trim())
-							.filter(Boolean);
+			.addText((t) =>
+				t.setValue(this.plugin.settings.defaultTags.join(", "))
+				 .onChange(async (v) => {
+					this.plugin.settings.defaultTags = v.split(",").map((x) => x.trim()).filter(Boolean);
+					await this.plugin.saveSettings();
+				 })
+			);
+
+		new Setting(containerEl)
+			.setName("File watcher debounce (ms)")
+			.setDesc("How long to wait after a file change before updating the placeholder (default: 2000)")
+			.addText((t) =>
+				t.setValue(String(this.plugin.settings.watchDebounceMs))
+				 .onChange(async (v) => {
+					const n = parseInt(v);
+					if (!isNaN(n) && n >= 500) {
+						this.plugin.settings.watchDebounceMs = n;
 						await this.plugin.saveSettings();
-					})
+					}
+				 })
 			);
 
 		new Setting(containerEl)
 			.setName("Open Bridge Manager on startup")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.openOnSync).onChange(async (v) => {
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.openOnSync).onChange(async (v) => {
 					this.plugin.settings.openOnSync = v;
 					await this.plugin.saveSettings();
 				})
@@ -564,12 +850,11 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 			for (const bridge of this.plugin.settings.bridges) {
 				new Setting(containerEl)
 					.setName(bridge.label)
-					.setDesc(`${bridge.externalPath} → ${bridge.vaultFolder}`)
+					.setDesc(`${bridge.externalPath} → ${bridge.vaultFolder}  |  Watch: ${bridge.watchEnabled ? "on" : "off"}`)
 					.addButton((btn) =>
 						btn.setButtonText("Remove").setWarning().onClick(async () => {
-							this.plugin.settings.bridges = this.plugin.settings.bridges.filter(
-								(b) => b.id !== bridge.id
-							);
+							this.plugin.stopWatcher(bridge.id);
+							this.plugin.settings.bridges = this.plugin.settings.bridges.filter((b) => b.id !== bridge.id);
 							await this.plugin.saveSettings();
 							this.display();
 						})
