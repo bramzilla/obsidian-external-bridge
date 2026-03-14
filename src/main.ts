@@ -462,14 +462,19 @@ export default class ExternalBridgePlugin extends Plugin {
 		}
 		if (!this.settings.syncLog) this.settings.syncLog = [];
 		if (this.settings.maxLogEntries === undefined) this.settings.maxLogEntries = 0;
-		// Trim existing log entries to cap on load
+		// Trim existing log entries to cap on load and persist the result
 		const capOnLoad = this.settings.maxLogEntries;
 		if (capOnLoad > 0) {
+			const countsBefore = this.settings.syncLog.length;
 			const counts: Record<string, number> = {};
 			this.settings.syncLog = this.settings.syncLog.filter((e) => {
 				counts[e.bridgeId] = (counts[e.bridgeId] ?? 0) + 1;
 				return counts[e.bridgeId] <= capOnLoad;
 			});
+			// Only save if we actually trimmed something — avoids unnecessary disk write
+			if (this.settings.syncLog.length < countsBefore) {
+				await this.saveData(this.settings);
+			}
 		}
 	}
 
@@ -1082,18 +1087,18 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Sync log limit")
-			.setDesc("Maximum number of sync entries to keep per bridge. Set to 0 to keep all entries indefinitely. Press Enter or click away to apply.")
+			.setDesc("Maximum number of sync entries to keep per bridge. Set to 0 to keep all entries indefinitely.")
 			.addText((t) => {
 				t.setValue(String(this.plugin.settings.maxLogEntries))
 				 .setPlaceholder("0 = unlimited");
-				// Apply only on blur (click away) or Enter — avoids trimming mid-keystroke
-				const applyLimit = async () => {
-					const raw = t.getValue().trim();
-					const n = parseInt(raw);
+
+				let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+				const applyLimit = async (value: string) => {
+					const n = parseInt(value.trim());
 					if (isNaN(n) || n < 0) return;
 					this.plugin.settings.maxLogEntries = n;
 					if (n > 0) {
-						// Trim per-bridge so each bridge keeps at most n entries
 						const counts: Record<string, number> = {};
 						this.plugin.settings.syncLog = this.plugin.settings.syncLog.filter((e) => {
 							counts[e.bridgeId] = (counts[e.bridgeId] ?? 0) + 1;
@@ -1102,8 +1107,23 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 					}
 					await this.plugin.saveSettings();
 				};
-				t.inputEl.addEventListener("blur", applyLimit);
-				t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") applyLimit(); });
+
+				// Debounced input — waits 800ms after typing stops, safe for multi-digit numbers
+				t.inputEl.addEventListener("input", () => {
+					if (debounceTimer) clearTimeout(debounceTimer);
+					debounceTimer = setTimeout(() => applyLimit(t.inputEl.value), 800);
+				});
+				// Also apply immediately on blur and Enter as backup
+				t.inputEl.addEventListener("blur", () => {
+					if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+					applyLimit(t.inputEl.value);
+				});
+				t.inputEl.addEventListener("keyup", (e) => {
+					if (e.key === "Enter") {
+						if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+						applyLimit(t.inputEl.value);
+					}
+				});
 			});
 
 		new Setting(containerEl)
