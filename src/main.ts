@@ -32,6 +32,20 @@ interface ExternalBridgeSettings {
 	defaultTags: string[];
 	openOnSync: boolean;
 	watchDebounceMs: number;
+	autoSyncOnStartup: boolean;
+}
+
+// Health status for a bridge path
+type BridgeHealth = "ok" | "unreachable" | "unknown";
+
+function checkBridgeHealth(bridge: BridgedFolder): BridgeHealth {
+	try {
+		if (!fs.existsSync(bridge.externalPath)) return "unreachable";
+		const stat = fs.statSync(bridge.externalPath);
+		return stat.isDirectory() ? "ok" : "unreachable";
+	} catch {
+		return "unreachable";
+	}
 }
 
 // User content is stored between the two sentinels in each placeholder note.
@@ -50,6 +64,7 @@ const DEFAULT_SETTINGS: ExternalBridgeSettings = {
 	defaultTags: [],
 	openOnSync: false,
 	watchDebounceMs: 2000,
+	autoSyncOnStartup: false,
 };
 
 const SUPPORTED_EXTENSIONS = [
@@ -384,8 +399,35 @@ export default class ExternalBridgePlugin extends Plugin {
 			});
 		}
 
-		// Start watchers for any bridge that has watching enabled
-		this.app.workspace.onLayoutReady(() => {
+		// Start watchers and run health checks on layout ready
+		this.app.workspace.onLayoutReady(async () => {
+			// Health check — warn about unreachable bridges
+			const unreachable = this.settings.bridges.filter(
+				(b) => checkBridgeHealth(b) === "unreachable"
+			);
+			if (unreachable.length > 0) {
+				const names = unreachable.map((b) => `"${b.label}"`).join(", ");
+				new Notice(
+					`External Bridge: ${unreachable.length} bridge${unreachable.length > 1 ? "s" : ""} unreachable — ${names}. Check that the external folder is accessible.`,
+					8000
+				);
+			}
+
+			// Auto-sync
+			if (this.settings.autoSyncOnStartup && this.settings.bridges.length > 0) {
+				const reachable = this.settings.bridges.filter(
+					(b) => checkBridgeHealth(b) === "ok"
+				);
+				if (reachable.length > 0) {
+					new Notice("External Bridge: auto-syncing on startup…");
+					for (const bridge of reachable) {
+						try { await this.syncBridge(bridge); } catch { /* skip unreachable */ }
+					}
+					new Notice("External Bridge: startup sync complete.");
+				}
+			}
+
+			// Start watchers for any bridge that has watching enabled
 			for (const bridge of this.settings.bridges) {
 				if (bridge.watchEnabled) this.startWatcher(bridge);
 			}
@@ -637,9 +679,18 @@ class BridgeManagerModal extends Modal {
 		const titleRow = header.createDiv("bridge-card-title-row");
 		titleRow.createEl("strong", { text: bridge.label });
 
+		// Health indicator
+		const health = checkBridgeHealth(bridge);
+		titleRow.createEl("span", {
+			cls: `bridge-health-dot ${health}`,
+			title: health === "ok"
+				? "External folder is accessible"
+				: "⚠ External folder is unreachable — check the path or mount the drive",
+		});
+
 		// Watcher status indicator
 		const watcherActive = this.plugin["watchers"].has(bridge.id);
-		const watchDot = titleRow.createEl("span", {
+		titleRow.createEl("span", {
 			cls: `bridge-watch-dot ${watcherActive ? "active" : "inactive"}`,
 			title: watcherActive ? "File watcher active" : "File watcher off",
 		});
@@ -659,6 +710,10 @@ class BridgeManagerModal extends Modal {
 		const actions = card.createDiv("bridge-actions");
 
 		const syncBtn = actions.createEl("button", { text: "↻ Sync" });
+		if (health === "unreachable") {
+			syncBtn.disabled = true;
+			syncBtn.title = "Cannot sync — external folder is unreachable";
+		}
 		syncBtn.onclick = async () => {
 			syncBtn.disabled = true;
 			syncBtn.setText("Syncing…");
@@ -847,6 +902,16 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("Auto-sync on startup")
+			.setDesc("Automatically sync all reachable bridges when Obsidian opens")
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.autoSyncOnStartup).onChange(async (v) => {
+					this.plugin.settings.autoSyncOnStartup = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
 			.setName("Open Bridge Manager on startup")
 			.addToggle((t) =>
 				t.setValue(this.plugin.settings.openOnSync).onChange(async (v) => {
@@ -862,7 +927,7 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 			for (const bridge of this.plugin.settings.bridges) {
 				new Setting(containerEl)
 					.setName(bridge.label)
-					.setDesc(`${bridge.externalPath} → ${bridge.vaultFolder}  |  Watch: ${bridge.watchEnabled ? "on" : "off"}`)
+					.setDesc(`${bridge.externalPath} → ${bridge.vaultFolder}  |  Watch: ${bridge.watchEnabled ? "on" : "off"}  |  Health: ${checkBridgeHealth(bridge) === "ok" ? "✓ reachable" : "⚠ unreachable"}`)
 					.addButton((btn) =>
 						btn.setButtonText("Remove").setWarning().onClick(async () => {
 							this.plugin.stopWatcher(bridge.id);

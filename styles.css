@@ -170,3 +170,32 @@
   margin: 0;
   accent-color: var(--interactive-accent);
 }
+
+/* ── Health indicator dot ────────────────────────────────────── */
+
+.bridge-health-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.bridge-health-dot.ok {
+  background: #4caf7d;
+}
+
+.bridge-health-dot.unreachable {
+  background: #e05252;
+  box-shadow: 0 0 0 2px rgba(224, 82, 82, 0.25);
+  animation: pulse-warning 2s ease-in-out infinite;
+}
+
+.bridge-health-dot.unknown {
+  background: var(--text-faint);
+}
+
+@keyframes pulse-warning {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(224, 82, 82, 0.25); }
+  50%       { box-shadow: 0 0 0 5px rgba(224, 82, 82, 0.08); }
+}
