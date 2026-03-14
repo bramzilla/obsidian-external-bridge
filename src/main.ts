@@ -44,10 +44,9 @@ interface ExternalBridgeSettings {
 	openOnSync: boolean;
 	watchDebounceMs: number;
 	autoSyncOnStartup: boolean;
-	syncLog: SyncLogEntry[];   // capped at MAX_LOG_ENTRIES
+	syncLog: SyncLogEntry[];   // capped at maxLogEntries
+	maxLogEntries: number;
 }
-
-const MAX_LOG_ENTRIES = 50;
 
 // Health status for a bridge path
 type BridgeHealth = "ok" | "unreachable" | "unknown";
@@ -80,6 +79,7 @@ const DEFAULT_SETTINGS: ExternalBridgeSettings = {
 	watchDebounceMs: 2000,
 	autoSyncOnStartup: false,
 	syncLog: [],
+	maxLogEntries: 0,  // 0 = unlimited
 };
 
 const SUPPORTED_EXTENSIONS = [
@@ -462,6 +462,7 @@ export default class ExternalBridgePlugin extends Plugin {
 			if (b.customProperties === undefined) b.customProperties = {};
 		}
 		if (!this.settings.syncLog) this.settings.syncLog = [];
+		if (this.settings.maxLogEntries === undefined) this.settings.maxLogEntries = 0;
 	}
 
 	async saveSettings() {
@@ -619,8 +620,9 @@ export default class ExternalBridgePlugin extends Plugin {
 				skipped,
 			};
 			this.settings.syncLog.unshift(entry); // newest first
-			if (this.settings.syncLog.length > MAX_LOG_ENTRIES) {
-				this.settings.syncLog = this.settings.syncLog.slice(0, MAX_LOG_ENTRIES);
+			const cap = this.settings.maxLogEntries;
+			if (cap > 0 && this.settings.syncLog.length > cap) {
+				this.settings.syncLog = this.settings.syncLog.slice(0, cap);
 			}
 		}
 
@@ -1059,6 +1061,25 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 					const n = parseInt(v);
 					if (!isNaN(n) && n >= 500) {
 						this.plugin.settings.watchDebounceMs = n;
+						await this.plugin.saveSettings();
+					}
+				 })
+			);
+
+		new Setting(containerEl)
+			.setName("Sync log limit")
+			.setDesc("Maximum number of sync entries to keep per bridge. Set to 0 to keep all entries indefinitely.")
+			.addText((t) =>
+				t.setValue(String(this.plugin.settings.maxLogEntries))
+				 .setPlaceholder("0 = unlimited")
+				 .onChange(async (v) => {
+					const n = parseInt(v);
+					if (!isNaN(n) && n >= 0) {
+						this.plugin.settings.maxLogEntries = n;
+						// Trim existing log if new cap is lower
+						if (n > 0 && this.plugin.settings.syncLog.length > n) {
+							this.plugin.settings.syncLog = this.plugin.settings.syncLog.slice(0, n);
+						}
 						await this.plugin.saveSettings();
 					}
 				 })
