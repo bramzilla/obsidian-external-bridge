@@ -91,6 +91,11 @@ const SUPPORTED_EXTENSIONS = [
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/** Escape a value for use inside a YAML double-quoted string. */
+function escapeYamlValue(value: string): string {
+	return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 function generateId(): string {
 	return Math.random().toString(36).slice(2, 10);
 }
@@ -149,15 +154,15 @@ function buildFrontmatter(
 	const allTags = [...new Set([...defaultTags, ext, "external-bridge"])].map((t) => `  - ${t}`).join("\n");
 
 	return `---
-external-path: "${filePath.replace(/\\/g, "/")}"
-external-file: "${fileName}"
+external-path: "${escapeYamlValue(filePath.replace(/\\/g, "/"))}"
+external-file: "${escapeYamlValue(fileName)}"
 external-type: "${ext}"
 external-size: "${stat ? formatFileSize(stat.size) : "unknown"}"
 external-modified: "${stat ? stat.mtime : "unknown"}"
 external-mtime-ms: ${stat ? stat.mtimeMs : 0}
 bridge-id: "${bridge.id}"
-bridge-label: "${bridge.label}"
-${Object.entries(bridge.customProperties ?? {}).map(([k, v]) => `${k}: "${v}"`).join("\n")}
+bridge-label: "${escapeYamlValue(bridge.label)}"
+${Object.entries(bridge.customProperties ?? {}).map(([k, v]) => `${k}: "${escapeYamlValue(v)}"`).join("\n")}
 tags:
 ${allTags}
 ---`;
@@ -183,7 +188,7 @@ function buildMetaBody(
 	if (ext === "pdf") {
 		previewBlock = `\n> [!info] External PDF\n> This file is stored outside your vault and is not synced.\n> [→ Open in system viewer](${obsidianUri})\n`;
 	} else if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
-		previewBlock = `\n![${fileName}](${filePath})\n`;
+		previewBlock = `\n![${fileName}](${obsidianUri})\n`;
 	} else if (["mp3", "mp4", "mov", "m4a"].includes(ext)) {
 		previewBlock = `\n> [!info] External Media\n> [→ Open in system viewer](${obsidianUri})\n`;
 	} else {
@@ -530,6 +535,10 @@ export default class ExternalBridgePlugin extends Plugin {
 		this.watchers.clear();
 	}
 
+	isWatcherActive(bridgeId: string): boolean {
+		return this.watchers.has(bridgeId);
+	}
+
 	// ─── Path helpers ──────────────────────────────────────────────────────────
 
 	externalPathToVaultPath(bridge: BridgedFolder, externalFile: string): string | null {
@@ -752,7 +761,7 @@ class BridgeManagerModal extends Modal {
 		});
 
 		// Watcher status indicator
-		const watcherActive = this.plugin["watchers"].has(bridge.id);
+		const watcherActive = this.plugin.isWatcherActive(bridge.id);
 		titleRow.createEl("span", {
 			cls: `bridge-watch-dot ${watcherActive ? "active" : "inactive"}`,
 			title: watcherActive ? "File watcher active" : "File watcher off",
@@ -797,7 +806,7 @@ class BridgeManagerModal extends Modal {
 			cls: watcherActive ? "mod-active" : "",
 		});
 		watchBtn.onclick = async () => {
-			if (this.plugin["watchers"].has(bridge.id)) {
+			if (this.plugin.isWatcherActive(bridge.id)) {
 				this.plugin.stopWatcher(bridge.id);
 				bridge.watchEnabled = false;
 			} else {
@@ -903,8 +912,8 @@ class AddBridgeModal extends Modal {
 				new Notice("Please fill in Label and External folder path.");
 				return;
 			}
-			if (!fs.existsSync(this.externalPath)) {
-				new Notice("External folder path does not exist.");
+			if (!fs.existsSync(this.externalPath) || !fs.statSync(this.externalPath).isDirectory()) {
+				new Notice("External folder path does not exist or is not a directory.");
 				return;
 			}
 
