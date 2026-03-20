@@ -13,6 +13,8 @@ import {
 
 import * as path from "path";
 import * as fs from "fs";
+// electron is bundled with Obsidian — use require so tsc doesn't need @types/electron
+const { shell } = require("electron") as { shell: { openPath: (path: string) => Promise<string> } };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -579,7 +581,10 @@ export default class ExternalBridgePlugin extends Plugin {
 
 	// ─── Sync ─────────────────────────────────────────────────────────────────
 
-	async syncBridge(bridge: BridgedFolder): Promise<{ created: number; updated: number; skipped: number; removed: number }> {
+	async syncBridge(
+		bridge: BridgedFolder,
+		onProgress?: (processed: number, total: number) => void
+	): Promise<{ created: number; updated: number; skipped: number; removed: number }> {
 		const targetVaultFolder = normalizePath(bridge.vaultFolder);
 
 		if (!this.app.vault.getAbstractFileByPath(targetVaultFolder)) {
@@ -594,6 +599,7 @@ export default class ExternalBridgePlugin extends Plugin {
 		const removedFiles: string[] = [];
 		const expectedPaths = new Set<string>();
 
+		let processed = 0;
 		for (const externalFile of externalFiles) {
 			const vaultPath = this.externalPathToVaultPath(bridge, externalFile);
 			if (!vaultPath) continue;
@@ -604,6 +610,9 @@ export default class ExternalBridgePlugin extends Plugin {
 			if (result === "created") createdFiles.push(name);
 			else if (result === "updated") updatedFiles.push(name);
 			else skipped++;
+
+			processed++;
+			onProgress?.(processed, externalFiles.length);
 		}
 
 		// Remove stale placeholders
@@ -781,7 +790,9 @@ class BridgeManagerModal extends Modal {
 			syncBtn.disabled = true;
 			syncBtn.setText("Syncing…");
 			try {
-				const result = await this.plugin.syncBridge(bridge);
+				const result = await this.plugin.syncBridge(bridge, (processed, total) => {
+					syncBtn.setText(`Syncing… ${processed}/${total}`);
+				});
 				new Notice(`"${bridge.label}": ${result.created} created, ${result.updated} updated, ${result.skipped} skipped, ${result.removed} removed.`);
 				this.render();
 			} catch (e) {
@@ -789,6 +800,20 @@ class BridgeManagerModal extends Modal {
 				syncBtn.disabled = false;
 				syncBtn.setText("↻ Sync");
 			}
+		};
+
+		const editBtn = actions.createEl("button", { text: "✎ Edit" });
+		editBtn.onclick = () => new EditBridgeModal(this.app, this.plugin, bridge, () => this.render()).open();
+
+		const openExtBtn = actions.createEl("button", { text: "↗ External" });
+		openExtBtn.title = "Open external folder in Finder / Explorer";
+		openExtBtn.onclick = () => shell.openPath(bridge.externalPath);
+
+		const openVaultBtn = actions.createEl("button", { text: "↗ Vault" });
+		openVaultBtn.title = "Open vault folder in Finder / Explorer";
+		openVaultBtn.onclick = () => {
+			const abs = path.join(this.plugin.getVaultBasePath(), bridge.vaultFolder);
+			shell.openPath(abs);
 		};
 
 		// Watch toggle button
@@ -948,6 +973,136 @@ class AddBridgeModal extends Modal {
 	onClose() { this.contentEl.empty(); }
 }
 
+
+// ─── Edit Bridge Modal ────────────────────────────────────────────────────────
+
+class EditBridgeModal extends Modal {
+	plugin: ExternalBridgePlugin;
+	bridge: BridgedFolder;
+	onSave: () => void;
+
+	label: string;
+	externalPath: string;
+	vaultFolder: string;
+	selectedExtensions: Set<string>;
+	recursive: boolean;
+	watchEnabled: boolean;
+	customPropertiesRaw: string;
+
+	constructor(app: App, plugin: ExternalBridgePlugin, bridge: BridgedFolder, onSave: () => void) {
+		super(app);
+		this.plugin = plugin;
+		this.bridge = bridge;
+		this.onSave = onSave;
+		// Pre-populate from existing bridge
+		this.label = bridge.label;
+		this.externalPath = bridge.externalPath;
+		this.vaultFolder = bridge.vaultFolder;
+		this.selectedExtensions = new Set(bridge.includedExtensions);
+		this.recursive = bridge.recursive;
+		this.watchEnabled = bridge.watchEnabled;
+		this.customPropertiesRaw = Object.entries(bridge.customProperties ?? {})
+			.map(([k, v]) => `${k}: ${v}`)
+			.join("\n");
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h2", { text: "Edit Bridge" });
+
+		new Setting(contentEl)
+			.setName("Label")
+			.addText((t) => t.setValue(this.label).onChange((v) => (this.label = v)));
+
+		new Setting(contentEl)
+			.setName("External folder path")
+			.setDesc("Absolute path to the folder on your disk")
+			.addText((t) => t.setValue(this.externalPath).onChange((v) => (this.externalPath = v)));
+
+		new Setting(contentEl)
+			.setName("Vault folder")
+			.setDesc("Where placeholder files live inside your vault. Changing this does not move existing placeholders.")
+			.addText((t) => t.setValue(this.vaultFolder).onChange((v) => (this.vaultFolder = v)));
+
+		new Setting(contentEl).setName("File types").setDesc("Which file types to create placeholders for");
+
+		const extGrid = contentEl.createDiv("ext-grid");
+		for (const ext of SUPPORTED_EXTENSIONS) {
+			const lbl = extGrid.createEl("label", { cls: "ext-checkbox" });
+			const cb  = lbl.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+			cb.checked = this.selectedExtensions.has(ext);
+			cb.onchange = () => { if (cb.checked) this.selectedExtensions.add(ext); else this.selectedExtensions.delete(ext); };
+			lbl.createSpan({ text: ext.toUpperCase() });
+		}
+
+		new Setting(contentEl)
+			.setName("Include subfolders")
+			.setDesc("Recursively include files in subfolders")
+			.addToggle((t) => t.setValue(this.recursive).onChange((v) => (this.recursive = v)));
+
+		new Setting(contentEl)
+			.setName("Custom properties")
+			.setDesc("Extra frontmatter fields added to every placeholder. One per line, format: key: value");
+		const customPropArea = contentEl.createEl("textarea", {
+			cls: "bridge-custom-props-textarea",
+			attr: { placeholder: "subject: music\nstatus: unreviewed" },
+		}) as HTMLTextAreaElement;
+		customPropArea.value = this.customPropertiesRaw;
+		customPropArea.oninput = () => { this.customPropertiesRaw = customPropArea.value; };
+
+		new Setting(contentEl)
+			.setName("Enable file watcher")
+			.setDesc("Automatically update placeholders when external files are added, changed, or deleted")
+			.addToggle((t) => t.setValue(this.watchEnabled).onChange((v) => (this.watchEnabled = v)));
+
+		const btnRow = contentEl.createDiv("bridge-btn-row");
+		const saveBtn = btnRow.createEl("button", { text: "Save", cls: "mod-cta" });
+		saveBtn.onclick = async () => {
+			if (!this.label || !this.externalPath) {
+				new Notice("Please fill in Label and External folder path.");
+				return;
+			}
+			if (!fs.existsSync(this.externalPath) || !fs.statSync(this.externalPath).isDirectory()) {
+				new Notice("External folder path does not exist or is not a directory.");
+				return;
+			}
+
+			const customProperties: Record<string, string> = {};
+			for (const line of this.customPropertiesRaw.split("\n")) {
+				const idx = line.indexOf(":");
+				if (idx === -1) continue;
+				const k = line.slice(0, idx).trim();
+				const v = line.slice(idx + 1).trim();
+				if (k) customProperties[k] = v;
+			}
+
+			// Update bridge in-place
+			this.bridge.label = this.label;
+			this.bridge.externalPath = this.externalPath;
+			this.bridge.vaultFolder = normalizePath(this.vaultFolder);
+			this.bridge.includedExtensions = [...this.selectedExtensions];
+			this.bridge.recursive = this.recursive;
+			this.bridge.watchEnabled = this.watchEnabled;
+			this.bridge.customProperties = customProperties;
+
+			await this.plugin.saveSettings();
+
+			// Restart watcher with updated config
+			this.plugin.stopWatcher(this.bridge.id);
+			if (this.bridge.watchEnabled) this.plugin.startWatcher(this.bridge);
+
+			this.close();
+			this.onSave();
+			new Notice(`Bridge "${this.label}" updated.`);
+		};
+
+		const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
+		cancelBtn.onclick = () => this.close();
+	}
+
+	onClose() { this.contentEl.empty(); }
+}
 
 // ─── Sync Log Modal ───────────────────────────────────────────────────────────
 
