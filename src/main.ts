@@ -98,6 +98,24 @@ function escapeYamlValue(value: string): string {
 	return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+/**
+ * Returns true if the string is safe to use as an unquoted YAML key.
+ * Keys with colons, quotes, hashes, or other special characters produce
+ * invalid or ambiguous YAML when written bare.
+ */
+function isValidYamlKey(key: string): boolean {
+	return key.length > 0 && /^[a-zA-Z0-9_-]+$/.test(key);
+}
+
+/**
+ * Strip characters that are unsafe to use as a vault folder path component.
+ * Prevents accidental nesting (label "Notes/2024") and path traversal (label "../../Root").
+ */
+function sanitizePathComponent(name: string): string {
+	return name.replace(/[/\\]/g, "-").replace(/\.{2,}/g, ".").trim() || "Bridge";
+}
+
+
 function generateId(): string {
 	return Math.random().toString(36).slice(2, 10);
 }
@@ -155,6 +173,11 @@ function buildFrontmatter(
 	const stat = getFileStat(filePath);
 	const allTags = [...new Set([...defaultTags, ext, "external-bridge"])].map((t) => `  - ${t}`).join("\n");
 
+	const customProps = Object.entries(bridge.customProperties ?? {})
+		.filter(([k]) => isValidYamlKey(k))
+		.map(([k, v]) => `${k}: "${escapeYamlValue(v)}"`)
+		.join("\n");
+
 	return `---
 external-path: "${escapeYamlValue(filePath.replace(/\\/g, "/"))}"
 external-file: "${escapeYamlValue(fileName)}"
@@ -164,7 +187,7 @@ external-modified: "${stat ? stat.mtime : "unknown"}"
 external-mtime-ms: ${stat ? stat.mtimeMs : 0}
 bridge-id: "${bridge.id}"
 bridge-label: "${escapeYamlValue(bridge.label)}"
-${Object.entries(bridge.customProperties ?? {}).map(([k, v]) => `${k}: "${escapeYamlValue(v)}"`).join("\n")}
+${customProps}
 tags:
 ${allTags}
 ---`;
@@ -259,10 +282,14 @@ function mergeUpdatedContent(
 		return `${frontmatter}\n${metaBody}${after}`;
 	}
 
-	// Legacy / missing sentinels — migrate and preserve any user content found
-	const preservedUserContent = existingContent
-		.split(USER_CONTENT_START)[1]
-		?.split(USER_CONTENT_END)[0] ?? "";
+	// Legacy / missing sentinels — migrate and preserve any user content found.
+	// Use indexOf+slice rather than split so sentinel text written by the user
+	// inside their notes doesn't corrupt extraction.
+	const ucStart = existingContent.indexOf(USER_CONTENT_START);
+	const ucEnd   = existingContent.indexOf(USER_CONTENT_END);
+	const preservedUserContent = (ucStart !== -1 && ucEnd > ucStart)
+		? existingContent.slice(ucStart + USER_CONTENT_START.length, ucEnd)
+		: "";
 
 	return `${frontmatter}
 ${metaBody}
@@ -276,7 +303,7 @@ ${USER_CONTENT_END}
 
 // ─── File Watcher ─────────────────────────────────────────────────────────────
 
-type WatcherCallback = (event: "add" | "change" | "unlink", filePath: string) => void;
+type WatcherCallback = (event: "add" | "change" | "unlink", filePath: string) => Promise<void>;
 
 class FolderWatcher {
 	private watcher: fs.FSWatcher | null = null;
@@ -348,7 +375,7 @@ class FolderWatcher {
 			for (const [f] of this.knownFiles) {
 				if (!currentSet.has(f)) {
 					this.knownFiles.delete(f);
-					this.callback("unlink", f);
+					void this.callback("unlink", f);
 				}
 			}
 		}, 5000);
@@ -360,22 +387,26 @@ class FolderWatcher {
 
 		const timer = setTimeout(() => {
 			this.debounceTimers.delete(filePath);
-			const exists = fs.existsSync(filePath);
-			if (!exists) {
-				this.knownFiles.delete(filePath);
-				this.callback("unlink", filePath);
-				return;
-			}
-			const stat = getFileStat(filePath);
-			if (!stat) return;
-			const known = this.knownFiles.get(filePath);
-			if (known === undefined) {
-				this.knownFiles.set(filePath, stat.mtimeMs);
-				this.callback(hintEvent ?? "add", filePath);
-			} else if (stat.mtimeMs > known) {
-				this.knownFiles.set(filePath, stat.mtimeMs);
-				this.callback("change", filePath);
-			}
+			// Async IIFE so vault operations inside the callback run sequentially
+			// and errors are contained to this single file event.
+			void (async () => {
+				const exists = fs.existsSync(filePath);
+				if (!exists) {
+					this.knownFiles.delete(filePath);
+					await this.callback("unlink", filePath);
+					return;
+				}
+				const stat = getFileStat(filePath);
+				if (!stat) return;
+				const known = this.knownFiles.get(filePath);
+				if (known === undefined) {
+					this.knownFiles.set(filePath, stat.mtimeMs);
+					await this.callback(hintEvent ?? "add", filePath);
+				} else if (stat.mtimeMs > known) {
+					this.knownFiles.set(filePath, stat.mtimeMs);
+					await this.callback("change", filePath);
+				}
+			})();
 		}, this.debounceMs);
 
 		this.debounceTimers.set(filePath, timer);
@@ -561,7 +592,11 @@ export default class ExternalBridgePlugin extends Plugin {
 		// Ensure parent folder exists
 		const parentDir = vaultPath.substring(0, vaultPath.lastIndexOf("/"));
 		if (parentDir && !this.app.vault.getAbstractFileByPath(parentDir)) {
-			await this.app.vault.createFolder(parentDir);
+			try {
+				await this.app.vault.createFolder(parentDir);
+			} catch {
+				// Folder may have been created concurrently by another watcher callback
+			}
 		}
 
 		const existing = this.app.vault.getAbstractFileByPath(vaultPath);
@@ -576,8 +611,11 @@ export default class ExternalBridgePlugin extends Plugin {
 		const existingFile = existing as TFile;
 		const existingContent = await this.app.vault.read(existingFile);
 
-		// Extract stored mtime from frontmatter to avoid unnecessary rewrites
-		const storedMtimeMatch = existingContent.match(/external-mtime-ms:\s*(\d+)/);
+		// Extract stored mtime from frontmatter only — searching the full file could
+		// match a value the user wrote in their notes, causing the file to never update.
+		const fmEnd = existingContent.indexOf("\n---\n", 3); // skip the opening "---"
+		const frontmatterText = fmEnd !== -1 ? existingContent.slice(0, fmEnd) : "";
+		const storedMtimeMatch = frontmatterText.match(/external-mtime-ms:\s*(\d+)/);
 		const storedMtime = storedMtimeMatch ? parseInt(storedMtimeMatch[1]) : 0;
 		const stat = getFileStat(externalFile);
 
@@ -624,13 +662,15 @@ export default class ExternalBridgePlugin extends Plugin {
 			onProgress?.(processed, externalFiles.length);
 		}
 
-		// Remove stale placeholders
+		// Remove stale placeholders — use the metadata cache instead of reading
+		// each file from disk (avoids O(n) full-file reads on every sync).
 		const folder = this.app.vault.getAbstractFileByPath(targetVaultFolder);
 		if (folder instanceof TFolder) {
 			const allFiles = this.getAllMarkdownFiles(folder);
 			for (const file of allFiles) {
 				if (!expectedPaths.has(file.path)) {
-					const bridgeId = await this.getBridgeIdFromFile(file.path);
+					const cache = this.app.metadataCache.getFileCache(file);
+					const bridgeId = (cache?.frontmatter?.["bridge-id"] as string) ?? null;
 					if (bridgeId === bridge.id) {
 						removedFiles.push(path.basename(file.path));
 						await this.app.vault.delete(file);
@@ -702,15 +742,7 @@ export default class ExternalBridgePlugin extends Plugin {
 		return results;
 	}
 
-	async getBridgeIdFromFile(vaultPath: string): Promise<string | null> {
-		try {
-			const file = this.app.vault.getAbstractFileByPath(vaultPath) as TFile;
-			if (!file) return null;
-			const content = await this.app.vault.read(file);
-			const match = content.match(/bridge-id:\s*"([^"]+)"/);
-			return match ? match[1] : null;
-		} catch { return null; }
-	}
+
 }
 
 // ─── Bridge Manager Modal ─────────────────────────────────────────────────────
@@ -955,7 +987,7 @@ class AddBridgeModal extends Modal {
 				id: generateId(),
 				label: this.label,
 				externalPath: this.externalPath,
-				vaultFolder: normalizePath(`${this.vaultFolder}/${this.label}`),
+				vaultFolder: normalizePath(`${this.vaultFolder}/${sanitizePathComponent(this.label)}`),
 				includedExtensions: [...this.selectedExtensions],
 				recursive: this.recursive,
 				lastSynced: null,
