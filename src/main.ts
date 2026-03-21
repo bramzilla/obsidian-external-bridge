@@ -5,6 +5,7 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	TextComponent,
 	TFolder,
 	TFile,
 	normalizePath,
@@ -15,6 +16,27 @@ import * as path from "path";
 import * as fs from "fs";
 // electron is bundled with Obsidian — use require so tsc doesn't need @types/electron
 const { shell } = require("electron") as { shell: { openPath: (path: string) => Promise<string> } };
+
+/**
+ * Open a native OS folder-picker dialog and return the selected path,
+ * or null if the user cancelled or the dialog API isn't available.
+ * Tries @electron/remote first (Obsidian 1.x), falls back to electron.remote.
+ */
+async function pickFolder(defaultPath?: string): Promise<string | null> {
+	type Dialog = { showOpenDialog(o: object): Promise<{ canceled: boolean; filePaths: string[] }> };
+	let dialog: Dialog | null = null;
+	try { dialog = (require("@electron/remote") as { dialog: Dialog }).dialog; }
+	catch { dialog = ((require("electron") as { remote?: { dialog: Dialog } }).remote?.dialog) ?? null; }
+	if (!dialog) return null;
+	try {
+		const result = await dialog.showOpenDialog({
+			title: "Select External Folder",
+			properties: ["openDirectory"],
+			...(defaultPath ? { defaultPath } : {}),
+		});
+		return result.canceled ? null : (result.filePaths[0] ?? null);
+	} catch { return null; }
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -921,10 +943,20 @@ class AddBridgeModal extends Modal {
 			.setDesc("A name for this bridge (e.g. Handwritten Notes)")
 			.addText((t) => t.setPlaceholder("My PDF Notes").onChange((v) => (this.label = v)));
 
+		let addPathText: TextComponent;
 		new Setting(contentEl)
 			.setName("External folder path")
 			.setDesc("Absolute path to the folder on your disk")
-			.addText((t) => t.setPlaceholder("/path/to/folder").onChange((v) => (this.externalPath = v)));
+			.addText((t) => {
+				addPathText = t;
+				t.setPlaceholder("/path/to/folder").onChange((v) => (this.externalPath = v));
+			})
+			.addButton((btn) =>
+				btn.setButtonText("Browse…").onClick(async () => {
+					const picked = await pickFolder(this.externalPath || undefined);
+					if (picked) { this.externalPath = picked; addPathText.setValue(picked); }
+				})
+			);
 
 		new Setting(contentEl)
 			.setName("Vault folder")
@@ -1056,10 +1088,20 @@ class EditBridgeModal extends Modal {
 			.setName("Label")
 			.addText((t) => t.setValue(this.label).onChange((v) => (this.label = v)));
 
+		let editPathText: TextComponent;
 		new Setting(contentEl)
 			.setName("External folder path")
 			.setDesc("Absolute path to the folder on your disk")
-			.addText((t) => t.setValue(this.externalPath).onChange((v) => (this.externalPath = v)));
+			.addText((t) => {
+				editPathText = t;
+				t.setValue(this.externalPath).onChange((v) => (this.externalPath = v));
+			})
+			.addButton((btn) =>
+				btn.setButtonText("Browse…").onClick(async () => {
+					const picked = await pickFolder(this.externalPath || undefined);
+					if (picked) { this.externalPath = picked; editPathText.setValue(picked); }
+				})
+			);
 
 		new Setting(contentEl)
 			.setName("Vault folder")
@@ -1255,6 +1297,16 @@ class ExternalBridgeSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "External Bridge Settings" });
+
+		new Setting(containerEl)
+			.setName("Bridge Manager")
+			.setDesc("Add, edit, sync, and monitor your external bridges")
+			.addButton((btn) =>
+				btn
+					.setButtonText("Open Bridge Manager")
+					.setCta()
+					.onClick(() => new BridgeManagerModal(this.app, this.plugin).open())
+			);
 
 		new Setting(containerEl)
 			.setName("Default tags")

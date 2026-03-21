@@ -320,3 +320,12 @@
   padding: 1px 0;
   word-break: break-all;
 }
+
+/* ── Browse-button path row ──────────────────────────────────── */
+
+/* Let the text input stretch to fill the space it shares with Browse… */
+.external-bridge-modal .setting-item-control input[type="text"],
+.bridge-path-setting .setting-item-control input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
